@@ -1,0 +1,150 @@
+{
+  "name": "shissues",
+  "displayName": "Shissues",
+  "description": "A lightweight GitHub Issues/PR wrapper for VS Code.",
+  "version": "0.0.1",
+  "publisher": "local-dev",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:shissues.menu",
+    "onCommand:shissues.init",
+    "onCommand:shissues.setAuthMode",
+    "onCommand:shissues.setPat",
+    "onCommand:shissues.showPermissions",
+    "onCommand:shissues.listIssues",
+    "onCommand:shissues.searchIssues",
+    "onCommand:shissues.refreshIssuesView",
+    "onCommand:shissues.setIssueFilter",
+    "onCommand:shissues.clearSearch",
+    "onCommand:shissues.viewIssueActions",
+    "onCommand:shissues.createIssue",
+    "onCommand:shissues.assignIssue",
+    "onCommand:shissues.createPullRequest",
+    "onView:shissues.issuesView"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "shissues.menu",
+        "title": "Shissues: Open Menu"
+      },
+      {
+        "command": "shissues.init",
+        "title": "Shissues: Init/Change Repo"
+      },
+      {
+        "command": "shissues.setAuthMode",
+        "title": "Shissues: Set Auth Mode"
+      },
+      {
+        "command": "shissues.setPat",
+        "title": "Shissues: Set GitHub PAT"
+      },
+      {
+        "command": "shissues.showPermissions",
+        "title": "Shissues: Show Required Permissions"
+      },
+      {
+        "command": "shissues.refreshIssuesView",
+        "title": "Shissues: Refresh Issues View"
+      },
+      {
+        "command": "shissues.setIssueFilter",
+        "title": "Shissues: Set Issue Filter"
+      },
+      {
+        "command": "shissues.clearSearch",
+        "title": "Shissues: Clear Issue Search"
+      },
+      {
+        "command": "shissues.listIssues",
+        "title": "Shissues: List Issues"
+      },
+      {
+        "command": "shissues.searchIssues",
+        "title": "Shissues: Search Issues"
+      },
+      {
+        "command": "shissues.createIssue",
+        "title": "Shissues: Create Issue"
+      },
+      {
+        "command": "shissues.assignIssue",
+        "title": "Shissues: Assign Issue"
+      },
+      {
+        "command": "shissues.createPullRequest",
+        "title": "Shissues: Create Pull Request"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "shissues",
+          "title": "Shissues",
+          "icon": "media/shissues.svg"
+        }
+      ]
+    },
+    "views": {
+      "shissues": [
+        {
+          "id": "shissues.issuesView",
+          "name": "Issues",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Shissues",
+      "properties": {
+        "shissues.repo": {
+          "type": "string",
+          "default": "",
+          "description": "Target repo in owner/repo format. If empty, Shissues falls back to current workspace origin remote if it is a GitHub remote."
+        },
+        "shissues.authMode": {
+          "type": "string",
+          "enum": [
+            "vscode",
+            "pat"
+          ],
+          "default": "vscode",
+          "description": "Auth method used for GitHub API calls."
+        },
+        "shissues.vscodeAuthScopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "repo"
+          ],
+          "description": "OAuth scopes requested from the VS Code GitHub auth provider."
+        },
+        "shissues.defaultBaseBranch": {
+          "type": "string",
+          "default": "main",
+          "description": "Default base branch when creating a pull request."
+        },
+        "shissues.defaultIssueFilter": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closed",
+            "all"
+          ],
+          "default": "open",
+          "description": "Default issue filter used in the sidebar view."
+        }
+      }
+    }
+  }
+}
