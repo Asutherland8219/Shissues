@@ -3,13 +3,22 @@
   "displayName": "Shissues",
   "description": "A lightweight GitHub Issues/PR wrapper for VS Code.",
   "version": "0.0.1",
-  "publisher": "local-dev",
+  "publisher": "Suds",
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": [
     "Other"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Asutherland8219/Shissues"
+  },
+  "homepage": "https://github.com/Asutherland8219/Shissues",
+  "bugs": {
+    "url": "https://github.com/Asutherland8219/Shissues/issues"
+  },
+  "icon": "media/shissues.png",
   "main": "./extension.js",
   "activationEvents": [
     "onStartupFinished",
