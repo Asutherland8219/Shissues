@@ -1,11 +1,20 @@
 const cp = require("child_process");
 const https = require("https");
+const path = require("path");
 const vscode = require("vscode");
 
 const CONFIG_ROOT = "shissues";
 const SECRET_PAT_KEY = "githubPat";
 const AUTH_VSCODE = "vscode";
 const AUTH_PAT = "pat";
+const DEFAULT_IMAGE_MAX_MB = 10;
+const IMAGE_MIME_EXTENSIONS = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/svg+xml": "svg"
+};
 
 const MENU_COMMANDS = {
   LIST_ISSUES: "shissues.listIssues",
@@ -253,6 +262,7 @@ async function showPermissionsDoc() {
     "Repository permissions:",
     "- Issues: **Read and write** (create/assign + list issues/labels).",
     "- Pull requests: **Read and write** (create pull requests).",
+    "- Contents: **Read and write** (store uploaded issue images in repo).",
     "- Metadata: **Read-only** (usually implicit).",
     "",
     "## If using a Classic PAT",
@@ -791,15 +801,6 @@ function toIssueEditorModel(issue) {
   };
 }
 
-function getNonce() {
-  let text = "";
-  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 32; i += 1) {
-    text += possible.charAt(Math.floor(Math.random() * possible.length));
-  }
-  return text;
-}
-
 class IssuesWebviewProvider {
   /**
    * @param {vscode.ExtensionContext} context
@@ -822,7 +823,8 @@ class IssuesWebviewProvider {
   resolveWebviewView(webviewView) {
     this.view = webviewView;
     webviewView.webview.options = {
-      enableScripts: true
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "media")]
     };
     webviewView.webview.html = this.getHtml(webviewView.webview);
     webviewView.webview.onDidReceiveMessage((message) => this.handleMessage(message));
@@ -923,6 +925,30 @@ class IssuesWebviewProvider {
           await setPat(this.context);
           await this.refresh();
           return;
+        case "setRepo": {
+          const payload = getMessagePayload(message);
+          await handleRepoSelection(this.context, payload);
+          await this.refresh();
+          return;
+        }
+        case "uploadImage": {
+          const payload = getMessagePayload(message);
+          try {
+            const uploaded = await uploadIssueImage(this.context, payload);
+            this.postMessage("imageUploaded", {
+              requestId: payload.requestId,
+              ...uploaded
+            });
+          } catch (error) {
+            const messageText = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Shissues: ${messageText}`);
+            this.postMessage("imageUploadError", {
+              requestId: payload.requestId,
+              message: messageText
+            });
+          }
+          return;
+        }
         default:
           return;
       }
@@ -937,54 +963,71 @@ class IssuesWebviewProvider {
     if (!this.view) {
       return;
     }
-
-    const repo = await getActiveRepo();
-    if (!repo) {
-      this.postState({
-        status: "noRepo",
-        repo: "",
-        filter: getIssueFilter(this.context),
-        search: getIssueSearch(this.context),
-        issues: []
-      });
-      return;
-    }
-
-    let token = "";
     try {
-      token = await getAuthToken(this.context);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.postState({
-        status: "noAuth",
-        repo,
-        filter: getIssueFilter(this.context),
-        search: getIssueSearch(this.context),
-        issues: [],
-        error: message
-      });
-      return;
-    }
+      const repo = await getActiveRepo();
+      const repoCandidates = await getWorkspaceRepoCandidates();
+      if (!repo) {
+        this.postState({
+          status: "noRepo",
+          repo: "",
+          repoCandidates,
+          filter: getIssueFilter(this.context),
+          search: getIssueSearch(this.context),
+          issues: []
+        });
+        return;
+      }
 
-    const filter = getIssueFilter(this.context);
-    const search = getIssueSearch(this.context);
-    try {
-      const issues = await fetchIssues(repo, token, { filter, search });
-      this.issueCache = new Map(issues.map((issue) => [issue.number, issue]));
-      this.postState({
-        status: "ok",
-        repo,
-        filter,
-        search,
-        issues: issues.map((issue) => toIssueViewModel(issue))
-      });
+      let token = "";
+      try {
+        token = await getAuthToken(this.context);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.postState({
+          status: "noAuth",
+          repo,
+          repoCandidates,
+          filter: getIssueFilter(this.context),
+          search: getIssueSearch(this.context),
+          issues: [],
+          error: message
+        });
+        return;
+      }
+
+      const filter = getIssueFilter(this.context);
+      const search = getIssueSearch(this.context);
+      try {
+        const issues = await fetchIssues(repo, token, { filter, search });
+        this.issueCache = new Map(issues.map((issue) => [issue.number, issue]));
+        this.postState({
+          status: "ok",
+          repo,
+          repoCandidates,
+          filter,
+          search,
+          issues: issues.map((issue) => toIssueViewModel(issue))
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.postState({
+          status: "error",
+          repo,
+          repoCandidates,
+          filter,
+          search,
+          issues: [],
+          error: message
+        });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.postState({
         status: "error",
-        repo,
-        filter,
-        search,
+        repo: "",
+        repoCandidates: [],
+        filter: getIssueFilter(this.context),
+        search: getIssueSearch(this.context),
         issues: [],
         error: message
       });
@@ -1060,13 +1103,17 @@ class IssuesWebviewProvider {
   }
 
   getHtml(webview) {
-    const nonce = getNonce();
     const csp = [
       "default-src 'none'",
       `img-src ${webview.cspSource} https:`,
       `style-src ${webview.cspSource} 'unsafe-inline'`,
-      `script-src 'nonce-${nonce}'`
+      `script-src ${webview.cspSource}`
     ].join("; ");
+    const imageMaxMb = getImageMaxSizeMB();
+    const imageMaxBytes = Math.round(imageMaxMb * 1024 * 1024);
+    const scriptUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.context.extensionUri, "media", "webview.js")
+    );
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1099,6 +1146,22 @@ class IssuesWebviewProvider {
         font-size: 12px;
         color: var(--vscode-descriptionForeground);
         margin-bottom: 8px;
+      }
+      .repo-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+      }
+      .repo-select {
+        max-width: 220px;
+        padding: 4px 6px;
+        border-radius: 4px;
+        border: 1px solid var(--vscode-dropdown-border, transparent);
+        background: var(--vscode-dropdown-background);
+        color: var(--vscode-dropdown-foreground);
+        font-size: 11px;
+        display: none;
       }
       .toolbar {
         display: flex;
@@ -1232,6 +1295,18 @@ class IssuesWebviewProvider {
         height: 30px;
         line-height: 1.2;
       }
+      .image-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .image-input {
+        display: none;
+      }
+      .image-status {
+        min-height: 16px;
+      }
       .dropdown {
         border: 1px solid var(--vscode-input-border, transparent);
         border-radius: 4px;
@@ -1317,6 +1392,7 @@ class IssuesWebviewProvider {
         flex-wrap: wrap;
         gap: 4px;
         margin-top: 6px;
+        margin-bottom: 6px;
       }
       .label {
         font-size: 10px;
@@ -1339,9 +1415,12 @@ class IssuesWebviewProvider {
       }
     </style>
   </head>
-  <body>
+  <body data-image-max-mb="${imageMaxMb}" data-image-max-bytes="${imageMaxBytes}">
     <div class="header">
-      <div id="repoLabel">Repo: —</div>
+      <div class="repo-row">
+        <div id="repoLabel">Repo: —</div>
+        <select id="repoSelect" class="repo-select"></select>
+      </div>
       <div id="summaryLabel"></div>
     </div>
     <div class="toolbar">
@@ -1376,6 +1455,14 @@ class IssuesWebviewProvider {
         <textarea id="issueBody" placeholder="Markdown description"></textarea>
       </div>
       <div class="field">
+        <div class="image-toolbar">
+          <button id="attachImageButton" class="secondary" type="button">Attach image</button>
+          <div class="muted" id="imageHelp"></div>
+        </div>
+        <input id="imageInput" class="image-input" type="file" accept="image/*" multiple />
+        <div class="muted image-status" id="imageStatus"></div>
+      </div>
+      <div class="field">
         <label>Labels</label>
         <details class="dropdown" id="labelsDropdown">
           <summary>Select labels</summary>
@@ -1397,337 +1484,7 @@ class IssuesWebviewProvider {
     <div class="status" id="status"></div>
     <div class="list" id="issueList"></div>
 
-    <script nonce="${nonce}">
-      const vscode = acquireVsCodeApi();
-      const repoLabel = document.getElementById("repoLabel");
-      const summaryLabel = document.getElementById("summaryLabel");
-      const status = document.getElementById("status");
-      const issueList = document.getElementById("issueList");
-      const searchInput = document.getElementById("searchInput");
-      const searchButton = document.getElementById("searchButton");
-      const clearButton = document.getElementById("clearButton");
-      const filterSelect = document.getElementById("filterSelect");
-      const refreshButton = document.getElementById("refreshButton");
-      const newIssueButton = document.getElementById("newIssueButton");
-      const editor = document.getElementById("editor");
-      const editorTitle = document.getElementById("editorTitle");
-      const editorClose = document.getElementById("editorClose");
-      const issueTitle = document.getElementById("issueTitle");
-      const issueBody = document.getElementById("issueBody");
-      const labelsDropdown = document.getElementById("labelsDropdown");
-      const assigneesDropdown = document.getElementById("assigneesDropdown");
-      const labelsList = document.getElementById("labelsList");
-      const assigneesList = document.getElementById("assigneesList");
-      const saveIssueButton = document.getElementById("saveIssueButton");
-      const cancelIssueButton = document.getElementById("cancelIssueButton");
-      let editorMode = "create";
-      let editorNumber = null;
-      let meta = { labels: [], assignees: [], loaded: false };
-      let pendingSelection = { labels: [], assignees: [] };
-      let currentRepo = "";
-
-      function post(type, payload = {}) {
-        vscode.postMessage({ type, ...payload });
-      }
-
-      function render(payload) {
-        currentRepo = payload.repo || "";
-        repoLabel.textContent = payload.repo ? "Repo: " + payload.repo : "Repo: —";
-        summaryLabel.textContent = payload.search
-          ? 'Search: "' + payload.search + '"'
-          : payload.filter
-            ? "Filter: " + payload.filter
-            : "";
-        searchInput.value = payload.search || "";
-        filterSelect.value = payload.filter || "open";
-        issueList.innerHTML = "";
-        refreshButton.classList.remove("spinning");
-
-        if (payload.status === "noRepo") {
-          status.textContent = "No repository configured.";
-          issueList.appendChild(buildEmpty("Set a repo to load issues.", "Init Repo", "initRepo"));
-          return;
-        }
-
-        if (payload.status === "noAuth") {
-          status.textContent = payload.error || "Authentication required.";
-          const container = document.createElement("div");
-          container.className = "empty";
-          container.textContent = "Configure auth to load issues.";
-          const actions = document.createElement("div");
-          actions.className = "issue-actions";
-          actions.appendChild(buildAction("Set Auth Mode", "setAuthMode"));
-          actions.appendChild(buildAction("Set PAT", "setPat"));
-          container.appendChild(actions);
-          issueList.appendChild(container);
-          return;
-        }
-
-        if (payload.status === "error") {
-          status.textContent = payload.error || "Failed to load issues.";
-          issueList.appendChild(buildEmpty("Try refreshing the view.", "Refresh", "refresh"));
-          return;
-        }
-
-        status.textContent = payload.issues.length
-          ? payload.issues.length + " issue(s)"
-          : "No issues found.";
-
-        if (!payload.issues.length) {
-          issueList.appendChild(buildEmpty("No issues match this view.", "Clear Search", "clearSearch"));
-          return;
-        }
-
-        payload.issues.forEach((issue) => {
-          issueList.appendChild(buildIssue(issue));
-        });
-      }
-
-      function applyMeta(newMeta) {
-        if (!newMeta) {
-          return;
-        }
-        meta = {
-          labels: Array.isArray(newMeta.labels) ? newMeta.labels : [],
-          assignees: Array.isArray(newMeta.assignees) ? newMeta.assignees : [],
-          repo: newMeta.repo || "",
-          loaded: true
-        };
-        renderMetaLists();
-      }
-
-      function buildEmpty(text, buttonLabel, action) {
-        const container = document.createElement("div");
-        container.className = "empty";
-        const label = document.createElement("div");
-        label.textContent = text;
-        container.appendChild(label);
-        if (buttonLabel && action) {
-          const actionButton = document.createElement("button");
-          actionButton.textContent = buttonLabel;
-          actionButton.className = "secondary";
-          actionButton.addEventListener("click", () => post(action));
-          container.appendChild(actionButton);
-        }
-        return container;
-      }
-
-      function buildAction(label, action, extra = {}) {
-        const button = document.createElement("button");
-        button.textContent = label;
-        button.className = "secondary";
-        button.addEventListener("click", () => post(action, extra));
-        return button;
-      }
-
-      function buildIssue(issue) {
-        const card = document.createElement("div");
-        card.className = "issue";
-
-        const title = document.createElement("div");
-        title.className = "issue-title";
-        title.textContent = "#" + issue.number + " " + issue.title;
-        card.appendChild(title);
-
-        const meta = document.createElement("div");
-        meta.className = "issue-meta";
-        meta.textContent =
-          (issue.state || "unknown") +
-          " • @" +
-          (issue.user || "unknown") +
-          " • updated " +
-          (issue.updatedAt || "unknown");
-        card.appendChild(meta);
-
-        if (issue.assignees && issue.assignees.length) {
-          const assignees = document.createElement("div");
-          assignees.className = "issue-meta";
-          assignees.textContent = "Assignees: " + issue.assignees.join(", ");
-          card.appendChild(assignees);
-        }
-
-        if (issue.labels && issue.labels.length) {
-          const labels = document.createElement("div");
-          labels.className = "labels";
-          issue.labels.forEach((label) => {
-            const pill = document.createElement("span");
-            pill.className = "label";
-            pill.textContent = label;
-            labels.appendChild(pill);
-          });
-          card.appendChild(labels);
-        }
-
-        const actions = document.createElement("div");
-        actions.className = "issue-actions";
-        actions.appendChild(buildAction("Open", "openIssue", { url: issue.htmlUrl }));
-        actions.appendChild(buildAction("Summary", "summaryIssue", { number: issue.number }));
-        actions.appendChild(buildAction("Copy URL", "copyIssue", { url: issue.htmlUrl }));
-        actions.appendChild(buildAction("Edit", "loadIssueForEdit", { number: issue.number }));
-        if (issue.state === "open") {
-          actions.appendChild(buildAction("Close", "setIssueState", { number: issue.number, state: "closed" }));
-        } else {
-          actions.appendChild(buildAction("Reopen", "setIssueState", { number: issue.number, state: "open" }));
-        }
-        card.appendChild(actions);
-
-        return card;
-      }
-
-      function updateDropdownSummary(dropdown, label, selected) {
-        const summary = dropdown.querySelector("summary");
-        if (!summary) {
-          return;
-        }
-        if (!selected.length) {
-          summary.textContent = "Select " + label.toLowerCase();
-          return;
-        }
-        const preview = selected.join(", ");
-        summary.textContent = preview;
-      }
-
-      function renderCheckboxList(container, items, selectedValues) {
-        container.innerHTML = "";
-        if (!items.length) {
-          const empty = document.createElement("div");
-          empty.className = "muted";
-          empty.textContent = "No options available.";
-          container.appendChild(empty);
-          return;
-        }
-        items.forEach((item) => {
-          const label = document.createElement("label");
-          label.className = "checkbox-item";
-          const input = document.createElement("input");
-          input.type = "checkbox";
-          input.value = item;
-          input.checked = selectedValues.has(item);
-          label.appendChild(input);
-          const text = document.createElement("span");
-          text.textContent = item;
-          label.appendChild(text);
-          container.appendChild(label);
-        });
-      }
-
-      function renderMetaLists() {
-        const selectedLabels = new Set(pendingSelection.labels || []);
-        const selectedAssignees = new Set(pendingSelection.assignees || []);
-        renderCheckboxList(labelsList, meta.labels || [], selectedLabels);
-        renderCheckboxList(assigneesList, meta.assignees || [], selectedAssignees);
-        updateDropdownSummary(labelsDropdown, "Labels", Array.from(selectedLabels));
-        updateDropdownSummary(assigneesDropdown, "Assignees", Array.from(selectedAssignees));
-      }
-
-      function getCheckedValues(container) {
-        return Array.from(container.querySelectorAll("input[type='checkbox']:checked")).map(
-          (input) => input.value
-        );
-      }
-
-      function openEditor(mode, issue) {
-        editorMode = mode;
-        editorNumber = issue ? issue.number : null;
-        editorTitle.textContent = mode === "edit" ? "Edit Issue" : "New Issue";
-        saveIssueButton.textContent = mode === "edit" ? "Update Issue" : "Create Issue";
-        issueTitle.value = issue ? issue.title || "" : "";
-        issueBody.value = issue ? issue.body || "" : "";
-        pendingSelection = {
-          labels: issue && issue.labels ? issue.labels : [],
-          assignees: issue && issue.assignees ? issue.assignees : []
-        };
-        renderMetaLists();
-        if (!meta.loaded || (meta.repo && meta.repo !== currentRepo)) {
-          post("requestMeta");
-        }
-        editor.classList.add("visible");
-      }
-
-      function closeEditor() {
-        editor.classList.remove("visible");
-        editorMode = "create";
-        editorNumber = null;
-        issueTitle.value = "";
-        issueBody.value = "";
-        pendingSelection = { labels: [], assignees: [] };
-        renderMetaLists();
-      }
-
-      searchButton.addEventListener("click", () => post("search", { value: searchInput.value }));
-      clearButton.addEventListener("click", () => post("clearSearch"));
-      refreshButton.addEventListener("click", () => {
-        refreshButton.classList.add("spinning");
-        post("refresh");
-      });
-      newIssueButton.addEventListener("click", () => openEditor("create"));
-      editorClose.addEventListener("click", () => closeEditor());
-      cancelIssueButton.addEventListener("click", () => closeEditor());
-      labelsList.addEventListener("change", () =>
-        (() => {
-          const selected = getCheckedValues(labelsList);
-          pendingSelection.labels = selected;
-          updateDropdownSummary(labelsDropdown, "Labels", selected);
-        })()
-      );
-      assigneesList.addEventListener("change", () =>
-        (() => {
-          const selected = getCheckedValues(assigneesList);
-          pendingSelection.assignees = selected;
-          updateDropdownSummary(assigneesDropdown, "Assignees", selected);
-        })()
-      );
-      saveIssueButton.addEventListener("click", () => {
-        const payload = {
-          title: issueTitle.value,
-          body: issueBody.value,
-          labels: getCheckedValues(labelsList),
-          assignees: getCheckedValues(assigneesList)
-        };
-        if (editorMode === "edit" && editorNumber) {
-          post("updateIssue", { number: editorNumber, ...payload });
-        } else {
-          post("createIssue", payload);
-        }
-      });
-      filterSelect.addEventListener("change", () =>
-        post("setFilter", { value: filterSelect.value })
-      );
-      searchInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-          post("search", { value: searchInput.value });
-        }
-      });
-
-      window.addEventListener("message", (event) => {
-        const message = event.data;
-        if (message.type === "render") {
-          render(message.payload);
-          refreshButton.classList.remove("spinning");
-        }
-        if (message.type === "editData") {
-          if (message.payload) {
-            if (message.payload.meta) {
-              applyMeta(message.payload.meta);
-            }
-            if (message.payload.issue) {
-              openEditor("edit", message.payload.issue);
-            }
-          }
-        }
-        if (message.type === "meta") {
-          applyMeta(message.payload);
-        }
-        if (message.type === "issueSaved") {
-          closeEditor();
-        }
-        if (message.type === "error") {
-          refreshButton.classList.remove("spinning");
-        }
-      });
-
-      post("ready");
-    </script>
+    <script src="${scriptUri}"></script>
   </body>
 </html>`;
   }
@@ -1798,6 +1555,55 @@ async function getActiveRepo() {
   return detectRepoFromWorkspaceRemote();
 }
 
+async function getWorkspaceRepoCandidates() {
+  const repos = new Set();
+  const configured = getConfig().get("repo", "").trim();
+  if (configured) {
+    repos.add(configured);
+  }
+  const folders = vscode.workspace.workspaceFolders || [];
+  await Promise.all(
+    folders.map(async (folder) => {
+      try {
+        const candidates = await getRepoCandidatesFromFolder(folder.uri.fsPath);
+        candidates.forEach((repo) => repos.add(repo));
+      } catch {
+        // Ignore folders without git remotes.
+      }
+    })
+  );
+  return Array.from(repos).sort();
+}
+
+async function handleRepoSelection(context, payload) {
+  const value = payload && payload.value ? String(payload.value).trim() : "";
+  if (!value) {
+    return;
+  }
+  if (value === "__auto__") {
+    await setConfigValue("repo", "");
+    vscode.window.showInformationMessage("Shissues will auto-detect the repo.");
+    return;
+  }
+  if (value === "__custom__") {
+    const current = getConfig().get("repo", "").trim();
+    const input = await vscode.window.showInputBox({
+      title: "Set Shissues Repo",
+      prompt: "owner/repo",
+      value: current || "",
+      validateInput: (text) => (text.trim() && text.includes("/") ? null : "Enter owner/repo")
+    });
+    if (!input) {
+      return;
+    }
+    await setConfigValue("repo", input.trim());
+    vscode.window.showInformationMessage(`Shissues repo set to ${input.trim()}`);
+    return;
+  }
+  await setConfigValue("repo", value);
+  vscode.window.showInformationMessage(`Shissues repo set to ${value}`);
+}
+
 function getConfig() {
   return vscode.workspace.getConfiguration(CONFIG_ROOT);
 }
@@ -1811,25 +1617,58 @@ async function setConfigValue(key, value) {
 }
 
 async function detectRepoFromWorkspaceRemote() {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
-    return undefined;
+  const folders = vscode.workspace.workspaceFolders || [];
+  for (const folder of folders) {
+    try {
+      const candidates = await getRepoCandidatesFromFolder(folder.uri.fsPath);
+      if (candidates.length) {
+        return candidates[0];
+      }
+    } catch {
+      // Ignore folders without git remotes.
+    }
   }
-  try {
-    const remote = await execFile("git", ["remote", "get-url", "origin"], folder.uri.fsPath);
-    return parseRepoFromRemote(remote.trim());
-  } catch {
-    return undefined;
-  }
+  return undefined;
 }
 
 function parseRepoFromRemote(remote) {
   // Supports: git@github.com:owner/repo.git and https://github.com/owner/repo.git
-  const match = remote.match(/github\.com[/:]([^/]+)\/([^/\n]+?)(?:\.git)?$/i);
+  const match = remote.match(/github\.com[/:]([^/]+)\/([^/\n]+?)(?:\.git)?\/?$/i);
   if (!match) {
     return undefined;
   }
   return `${match[1]}/${match[2]}`;
+}
+
+async function getRepoCandidatesFromFolder(folderPath) {
+  const remotes = await listGitRemotes(folderPath);
+  if (!remotes.length) {
+    return [];
+  }
+  const ordered = remotes.includes("origin")
+    ? ["origin", ...remotes.filter((name) => name !== "origin")]
+    : remotes;
+  const repos = [];
+  for (const name of ordered) {
+    try {
+      const remote = await execFile("git", ["remote", "get-url", name], folderPath);
+      const repo = parseRepoFromRemote(remote.trim());
+      if (repo && !repos.includes(repo)) {
+        repos.push(repo);
+      }
+    } catch {
+      // Ignore invalid remotes.
+    }
+  }
+  return repos;
+}
+
+async function listGitRemotes(folderPath) {
+  const output = await execFile("git", ["remote"], folderPath);
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 function execFile(command, args, cwd) {
@@ -1915,6 +1754,140 @@ async function setIssueSearchState(context, search) {
 
 async function clearIssueSearchState(context) {
   await context.workspaceState.update("issueSearch", "");
+}
+
+function getImageMaxSizeMB() {
+  const raw = Number(getConfig().get("imageMaxSizeMB", DEFAULT_IMAGE_MAX_MB));
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return DEFAULT_IMAGE_MAX_MB;
+  }
+  return raw;
+}
+
+function getImageMaxSizeBytes() {
+  return Math.round(getImageMaxSizeMB() * 1024 * 1024);
+}
+
+function normalizeRepoPath(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((segment) => segment && segment !== "." && segment !== "..")
+    .join("/");
+}
+
+function getImageUploadPathPrefix() {
+  const configured = getConfig().get("imageUploadPath", ".shissues/uploads");
+  return normalizeRepoPath(configured);
+}
+
+function sanitizeFileStem(name) {
+  const base = String(name || "")
+    .trim()
+    .replace(/\.[^/.]+$/, "");
+  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned || "image";
+}
+
+function resolveImageExtension(name, mime) {
+  const extFromMime = IMAGE_MIME_EXTENSIONS[mime] || "";
+  const extFromName = path.extname(String(name || "")).replace(".", "").toLowerCase();
+  const ext = extFromMime || extFromName || "png";
+  return ext.replace(/[^a-z0-9]/g, "") || "png";
+}
+
+function buildImageRepoPath(name, mime) {
+  const baseName = path.basename(String(name || ""));
+  const stem = sanitizeFileStem(baseName);
+  const ext = resolveImageExtension(baseName, mime);
+  const stamp = formatTimestamp(new Date());
+  const nonce = Math.random().toString(36).slice(2, 8);
+  const filename = `${stamp}-${nonce}-${stem}.${ext}`;
+  const prefix = getImageUploadPathPrefix();
+  const repoPath = prefix ? `${prefix}/${filename}` : filename;
+  return {
+    repoPath,
+    filename,
+    alt: stem
+  };
+}
+
+function formatTimestamp(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return (
+    date.getFullYear() +
+    pad(date.getMonth() + 1) +
+    pad(date.getDate()) +
+    "-" +
+    pad(date.getHours()) +
+    pad(date.getMinutes()) +
+    pad(date.getSeconds())
+  );
+}
+
+function stripDataUrlPrefix(data) {
+  const raw = String(data || "");
+  const comma = raw.indexOf(",");
+  if (raw.startsWith("data:") && comma >= 0) {
+    return raw.slice(comma + 1);
+  }
+  return raw;
+}
+
+async function resolveImageUploadBranch(repo, token) {
+  const configured = String(getConfig().get("imageUploadBranch", "")).trim();
+  if (configured) {
+    return configured;
+  }
+  try {
+    const repoInfo = await githubRequest(token, "GET", `/repos/${repo}`);
+    if (repoInfo && repoInfo.default_branch) {
+      return repoInfo.default_branch;
+    }
+  } catch {
+    // Fall through to default branch setting.
+  }
+  return getConfig().get("defaultBaseBranch", "main");
+}
+
+async function uploadIssueImage(context, payload) {
+  const repo = await requireRepo(context);
+  const token = await getAuthToken(context);
+  const data = stripDataUrlPrefix(payload && payload.data);
+  const mime = payload && payload.mime ? String(payload.mime) : "";
+  if (!data) {
+    throw new Error("Image data is missing.");
+  }
+  if (!mime || !mime.startsWith("image/")) {
+    throw new Error("Unsupported image type.");
+  }
+
+  const buffer = Buffer.from(data, "base64");
+  if (!buffer.length) {
+    throw new Error("Image data is empty.");
+  }
+  const maxBytes = getImageMaxSizeBytes();
+  if (buffer.length > maxBytes) {
+    const maxMb = getImageMaxSizeMB();
+    throw new Error(`Image exceeds ${maxMb} MB limit.`);
+  }
+
+  const { repoPath, filename, alt } = buildImageRepoPath(payload && payload.name, mime);
+  const branch = await resolveImageUploadBranch(repo, token);
+  const response = await githubRequest(token, "PUT", `/repos/${repo}/contents/${repoPath}`, {
+    message: `Add issue image ${filename}`,
+    content: buffer.toString("base64"),
+    branch
+  });
+  const downloadUrl = response && response.content ? response.content.download_url : "";
+  const url = downloadUrl || `https://raw.githubusercontent.com/${repo}/${branch}/${repoPath}`;
+  return {
+    url,
+    markdown: `![${alt}](${url})`,
+    path: repoPath,
+    name: filename
+  };
 }
 
 function parseCsvList(value) {

@@ -143,6 +143,21 @@
           ],
           "default": "open",
           "description": "Default issue filter used in the sidebar view."
+        },
+        "shissues.imageUploadPath": {
+          "type": "string",
+          "default": ".shissues/uploads",
+          "description": "Repository path for storing issue image uploads (relative to repo root)."
+        },
+        "shissues.imageUploadBranch": {
+          "type": "string",
+          "default": "",
+          "description": "Branch to store uploaded issue images. If empty, the repo default branch is used."
+        },
+        "shissues.imageMaxSizeMB": {
+          "type": "number",
+          "default": 10,
+          "description": "Maximum image size (MB) accepted for uploads/paste."
         }
       }
     }
